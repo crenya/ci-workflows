@@ -1,0 +1,226 @@
+name: frappe-app
+
+# One Frappe app's server tests on crenya-ci, for every repository that calls it (docs/design.md section 7.5):
+#
+#   jobs:
+#     server:
+#       uses: crenya/crenya_ci/.github/workflows/frappe-app.yml@main
+#       with:
+#         app: my_app
+#       secrets:
+#         ssh_key: ${{ secrets.ERPTRUE_APP_DEPLOY_KEY }}   # only when extra_apps has a private repository
+#
+# Jobs run side by side on the box: each gets the free host ports Docker picked for its own mariadb/redis and
+# its own bench in the job's temp dir. A draft pull request tests draft_frappe_versions only.
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: the app's module name (as in hooks.py)
+        type: string
+        required: true
+      frappe_versions:
+        description: JSON list of Frappe branches
+        type: string
+        default: '["version-15", "version-16"]'
+      draft_frappe_versions:
+        description: JSON list for a draft pull request (production's version by default; saves the box)
+        type: string
+        default: '["version-16"]'
+      erpnext:
+        description: install ERPNext first
+        type: boolean
+        default: true
+      erpnext_before_tests:
+        description: run erpnext.setup.utils.before_tests (the company, fiscal year and defaults ERPNext's tests expect)
+        type: boolean
+        default: true
+      hrms:
+        description: install HRMS after ERPNext
+        type: boolean
+        default: false
+      extra_apps:
+        description: |
+          more apps to get and install before this one, one per line: "<name> <git url> [branch]"
+          (a git@github.com: url is fetched with the ssh_key secret; branch defaults to the Frappe branch)
+        type: string
+        default: ''
+      apt_packages:
+        description: extra apt packages (space separated)
+        type: string
+        default: ''
+      run_tests_args:
+        description: extra arguments to `bench run-tests` (e.g. --module my_app.tests.test_x)
+        type: string
+        default: ''
+      require_tests:
+        description: |
+          fail when Frappe ran no tests. false only for an app with no Frappe tests (its tests run elsewhere,
+          e.g. standalone scripts in another job); the check then still proves the app installs
+        type: boolean
+        default: true
+      site_config:
+        description: |
+          more site config, one per line: "<key> <value>"; $DB_PORT, $REDIS_CACHE_PORT and $REDIS_QUEUE_PORT
+          are this job's ports (e.g. "my_redis_url redis://127.0.0.1:$REDIS_CACHE_PORT/15")
+        type: string
+        default: ''
+    secrets:
+      ssh_key:
+        description: read-only deploy key for private extra_apps
+        required: false
+
+jobs:
+  server:
+    name: Server (${{ matrix.frappe }})
+    runs-on: [self-hosted, crenya-ci]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        frappe: ${{ fromJSON(github.event.pull_request.draft && inputs.draft_frappe_versions || inputs.frappe_versions) }}
+    services:
+      redis-cache:
+        image: redis:alpine
+        ports: ['6379']
+      redis-queue:
+        image: redis:alpine
+        ports: ['6379']
+      mariadb:
+        image: mariadb:${{ matrix.frappe == 'version-15' && '10.6' || '11.8' }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports: ['3306']
+        options: --health-cmd="mariadb-admin ping" --health-interval=5s --health-timeout=2s --health-retries=10
+    env:
+      PYTHON: ${{ matrix.frappe == 'version-15' && '3.10' || '3.14' }}
+      NODE: ${{ matrix.frappe == 'version-15' && '18' || '24' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ports and bench of this job
+        run: |
+          {
+            echo "DB_PORT=${{ job.services.mariadb.ports['3306'] }}"
+            echo "REDIS_CACHE_PORT=${{ job.services.redis-cache.ports['6379'] }}"
+            echo "REDIS_QUEUE_PORT=${{ job.services.redis-queue.ports['6379'] }}"
+            echo "BENCH=$RUNNER_TEMP/frappe-bench"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE }}
+
+      - name: Packages
+        env:
+          EXTRA: ${{ inputs.apt_packages }}
+        run: |
+          # jobs run side by side: wait for another job's apt instead of failing on its lock
+          pkgs=()
+          # shellcheck disable=SC2086
+          for p in mariadb-client $EXTRA; do dpkg -s "$p" >/dev/null 2>&1 || pkgs+=("$p"); done
+          [ ${#pkgs[@]} -eq 0 ] && exit 0
+          sudo apt-get -o DPkg::Lock::Timeout=600 update -qq
+          sudo apt-get -o DPkg::Lock::Timeout=600 install -y -qq "${pkgs[@]}"
+
+      # the job's temp dir, not the shared HOME: jobs run side by side
+      - name: SSH key for private apps
+        env:
+          SSH_KEY: ${{ secrets.ssh_key }}
+        run: |
+          [ -n "${SSH_KEY:-}" ] || exit 0
+          ( umask 077; printf '%s\n' "$SSH_KEY" > "$RUNNER_TEMP/deploy_key" )
+          # GitHub's published host key (api.github.com/meta), not a scan
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$RUNNER_TEMP/known_hosts"
+          echo "GIT_SSH_COMMAND=ssh -i $RUNNER_TEMP/deploy_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts" >> "$GITHUB_ENV"
+
+      - name: Bench
+        run: |
+          pip install -q frappe-bench
+          bench init --skip-redis-config-generation --skip-assets --frappe-branch "${{ matrix.frappe }}" --python "$(which python)" "$BENCH"
+          mariadb --host 127.0.0.1 --port "$DB_PORT" -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'; SET GLOBAL collation_server = 'utf8mb4_unicode_ci'"
+          cd "$BENCH"
+          bench set-config -g db_host 127.0.0.1
+          bench set-config -g db_port "$DB_PORT"
+          bench set-config -g redis_cache "redis://127.0.0.1:$REDIS_CACHE_PORT"
+          bench set-config -g redis_queue "redis://127.0.0.1:$REDIS_QUEUE_PORT"
+          bench set-config -g redis_socketio "redis://127.0.0.1:$REDIS_QUEUE_PORT"
+
+      - name: Site
+        working-directory: ${{ env.BENCH }}
+        env:
+          CI: 'Yes'
+          APP: ${{ inputs.app }}
+          FRAPPE: ${{ matrix.frappe }}
+          ERPNEXT: ${{ inputs.erpnext }}
+          HRMS: ${{ inputs.hrms }}
+          BEFORE_TESTS: ${{ inputs.erpnext_before_tests }}
+          EXTRA_APPS: ${{ inputs.extra_apps }}
+          SITE_CONFIG: ${{ inputs.site_config }}
+        run: |
+          set -euo pipefail
+          base=() order=()
+          if [ "$ERPNEXT" = true ]; then bench get-app --branch "$FRAPPE" erpnext; base+=(erpnext); fi
+          if [ "$HRMS" = true ]; then bench get-app --branch "$FRAPPE" hrms; base+=(hrms); fi
+          while read -r name url branch; do
+            [ -n "${name:-}" ] || continue
+            bench get-app --branch "${branch:-$FRAPPE}" "$name" "$url"
+            order+=("$name")
+          done <<< "$EXTRA_APPS"
+          bench get-app "$APP" "$GITHUB_WORKSPACE"
+          order+=("$APP")
+          bench setup requirements --dev
+
+          # Installing Frappe + ERPNext on an empty site is 3+ min of every run and gives the same database
+          # each time: the first job on new commits of those apps saves it on the box, later jobs start from it.
+          cache=/home/runner/.crenya-ci/site-cache
+          mkdir -p "$cache"
+          key="$FRAPPE-$(for a in frappe "${base[@]}"; do git -C "apps/$a" rev-parse --short=12 HEAD; done | paste -sd-)"
+          snap="$cache/$key.sql"
+          new_site=(bench new-site --db-host 127.0.0.1 --db-port "$DB_PORT" --db-root-password root --admin-password admin)
+          if [ -s "$snap" ] && "${new_site[@]}" --source-sql "$snap" test_site; then
+            echo "site from $key"
+          else
+            [ -d sites/test_site ] && bench drop-site test_site --force --no-backup --db-root-password root
+            "${new_site[@]}" test_site
+            for a in "${base[@]}"; do bench --site test_site install-app "$a"; done
+            db=$(python -c 'import json;print(json.load(open("sites/test_site/site_config.json"))["db_name"])')
+            mariadb-dump --host 127.0.0.1 --port "$DB_PORT" -u root -proot --single-transaction "$db" > "$snap.$$" \
+              && mv "$snap.$$" "$snap" && echo "saved $key"
+            find "$cache" -name '*.sql*' -mtime +7 -delete
+          fi
+          for a in "${order[@]}"; do bench --site test_site install-app "$a"; done
+          bench --site test_site set-config allow_tests true
+          while read -r k v; do
+            [ -n "${k:-}" ] || continue
+            v=${v//\$DB_PORT/$DB_PORT} v=${v//\$REDIS_CACHE_PORT/$REDIS_CACHE_PORT} v=${v//\$REDIS_QUEUE_PORT/$REDIS_QUEUE_PORT}
+            bench --site test_site set-config "$k" "$v"
+          done <<< "$SITE_CONFIG"
+          # ERPNext's test company, fiscal year and defaults: v15 has a function for it, v16 a test module
+          if [ "$ERPNEXT" = true ] && [ "$BEFORE_TESTS" = true ]; then
+            if grep -q "^def before_tests" apps/erpnext/erpnext/setup/utils.py; then
+              bench --site test_site execute erpnext.setup.utils.before_tests
+            else
+              bench --site test_site run-tests --app erpnext --module erpnext.tests.bootstrap_test_data
+            fi
+          fi
+          bench build
+
+      - name: Tests
+        working-directory: ${{ env.BENCH }}
+        env:
+          TYPE: server
+          APP: ${{ inputs.app }}
+          ARGS: ${{ inputs.run_tests_args }}
+          REQUIRE: ${{ inputs.require_tests }}
+        run: |
+          set -o pipefail
+          # shellcheck disable=SC2086
+          bench --site test_site run-tests --app "$APP" $ARGS 2>&1 | tee "$RUNNER_TEMP/tests.log"
+          # a green check must mean tests ran: a moved test folder or a bad --module ran none
+          grep -qE "^Ran [1-9][0-9]* tests?" "$RUNNER_TEMP/tests.log" && exit 0
+          [ "$REQUIRE" = true ] && { echo "::error::no tests ran"; exit 1; }
+          echo "::notice::no Frappe tests (require_tests: false): the app installed"
